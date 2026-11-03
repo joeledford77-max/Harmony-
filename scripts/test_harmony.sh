@@ -35,7 +35,7 @@ CEW_HP=${CEW_URL#https://}
 P=$HOME/.harmony_test
 LOG=$HOME/harmony_test_$(date +%Y%m%d_%H%M%S).log
 MODE=${1:-all}
-HV=2026-10-31.v19.1
+HV=2026-11-02.v19.3
 PEER_DIRTY=0   # set while intent's veto step has the peer on a lowered limit
 # One exit path for every mode: stop throwaway nodes, put the peer back on its normal settings if
 # the veto step was interrupted, remove temp files.
@@ -50,6 +50,9 @@ T=$(mktemp -d); trap on_exit EXIT
 G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
 np=0 nf=0 nw=0 GW_UP=0 CEW_UP=0 REVOKED_OPEN=0
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+# node logs can hold bytes that are not text (a model's output, a log rotated under a writer):
+# read them as text anyway, or grep prints "binary file matches" instead of the line
+grep() { command grep -a "$@"; }
 say()  { printf '%s\n' "$*"; printf '%s\n' "$*" | strip >> "$LOG"; }
 ok()   { np=$((np+1)); say "${G}PASS${N} $*"; }
 bad()  { nf=$((nf+1)); say "${R}FAIL${N} $*"; }
@@ -861,7 +864,7 @@ peer_restore() {
   PEER_DIRTY=0
   say "  restoring the peer's normal settings (node.sh restart on $PEER_SSH)…"
   if peer_node restart; then say "  peer restarted with its normal settings"
-  else say "  ${R}could not restart the peer${N}: run  ssh $PEER_SSH 'bash ~/node.sh restart'"; fi
+  else say "  ${R}could not restart the peer${N} ($(tail -n 3 "$T/peer" | strip | tr '\n' ' ')): run  ssh $PEER_SSH 'bash ~/node.sh restart'"; fi
 }
 # Until this node sees peer <id> on gossip below its own limit -> VIT "temp max".
 peer_cool_wait() {  # <peer id>
@@ -1042,7 +1045,10 @@ test_intent() {
     if peer_node restart; then
       if peer_limit_wait "$target" "$back"; then ok "the $tname restarted with its normal $back °C limit and is back on gossip"
       else wrn "the $tname restarted but has not reappeared with its $back °C limit yet"; fi
-    else bad "could not restart the $tname: run  ssh $PEER_SSH 'bash ~/node.sh restart'"; fi
+    else
+      bad "could not restart the $tname ($(tail -n 3 "$T/peer" | strip | tr '\n' ' ')): run  ssh $PEER_SSH 'bash ~/node.sh restart'"
+      peer_restore
+    fi
   fi
   req "$GW_URL/health"
   local left; left=$(jq -r '.placement.expires_in_s // empty' "$T/body")
@@ -1251,7 +1257,7 @@ test_harden() {
   if jq -e --arg id "$sid" 'any(.[]; .id == $id)' "$T/body" >/dev/null 2>&1; then bad "the stranger is in this node's peers"
   else ok "the stranger never became this node's peer"; fi
   if [ -n "${PEER_SSH:-}" ]; then
-    out=$(peer_sh "sed 's/\x1b\[[0-9;]*m//g' ~/p2p.log | grep -m1 'rejected hello from untrusted ${sid:0:12}'")
+    out=$(peer_sh "sed 's/\x1b\[[0-9;]*m//g' ~/p2p.log | grep -a -m1 'rejected hello from untrusted ${sid:0:12}'")
     if [ -n "$out" ]; then ok "the laptop refused the stranger at the handshake"
     elif [ "$lmode" = strict ]; then bad "no refusal of ${sid:0:12} in the laptop's ~/p2p.log"
     else info "the laptop is not strict, so it took the stranger in"; fi

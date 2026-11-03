@@ -37,6 +37,35 @@ Nothing here adds a message to the network: it all rides on gossip the mesh alre
 - Advisory runs are refused at or above `--max-temp`, so a hot device doesn't spend heat on advice;
   it relays the directive anyway and advises once it cools.
 
+## Use it from any OpenAI client
+Each node speaks OpenAI's chat-completions API on loopback, so chat apps, editor plugins and the
+official SDKs use the mesh unchanged: base URL `http://127.0.0.1:3005/v1`, any API key, model `harmony`.
+```
+curl -s http://127.0.0.1:3005/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"harmony","messages":[{"role":"user","content":"Hello"}]}'
+```
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:3005/v1", api_key="local")
+reply = client.chat.completions.create(model="harmony", messages=[{"role": "user", "content": "Hello"}])
+print(reply.choices[0].message.content)
+```
+- A conversation is placed like an `/infer` job: the AI placement decision in force unless the rules
+  veto it, else this device; when this device is too hot or busy, the coolest idle peers are asked one
+  at a time. The response's `harmony` field and its `x-harmony-device` header name the device that answered.
+- Conversations are cut to 8 KB, oldest turns first. `stream: true` returns OpenAI's server-sent
+  events, in one piece once the answer is complete. `"harmony": {"offload": false}` keeps a request
+  on this device. `GET /v1/models` lists the mesh as one model.
+- Like the rest of the operator API it answers loopback only (off loopback, `HARMONY_ADMIN_TOKEN` is
+  the API key) and grants no CORS, so a web page cannot call it.
+
+## The model stays loaded
+Each node runs llama.cpp's `llama-server` once (loopback, a free port, a random API key, one slot)
+and keeps the model loaded between jobs, so a job no longer pays for loading it off flash. After
+`--llama-idle-secs` (15 minutes) without a job it unloads the model and the next job loads it again.
+The thermal limit, cooldown and one-job-at-a-time rule sit in front of it unchanged. A node without
+`llama-server` runs each job with `--llama-bin` as before (`--llama-server off` forces that).
+
 ## Run
 ```
 cargo build --release
