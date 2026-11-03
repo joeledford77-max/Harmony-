@@ -1,0 +1,61 @@
+[package]
+name = "rust_p2p_node"
+version = "3.3.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Harmony gateway: post-quantum MANET node with identity-hiding handshake and traffic-analysis resistance"
+
+[[bin]]
+name = "rust_p2p_node"
+path = "src/main.rs"
+
+[dependencies]
+# ── async runtime / web ──
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal", "sync", "io-util"] }
+axum = { version = "0.7", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["catch-panic"] }
+
+# ── serialization / cli ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+# ── observability ──
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── HTTP client for gossip/handshake ──
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# ── CNSA 2.0 cryptographic stack ──
+# Key establishment: ML-KEM-1024 (FIPS 203)
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+# Signatures: ML-DSA-87 (FIPS 204)
+ml-dsa = { version = "0.1", features = ["getrandom", "alloc"] }
+# Bulk: AES-256-GCM (FIPS 197 / SP 800-38D)
+aes-gcm = "0.10"
+# Hash + KDF: SHA-384 / HKDF-SHA-384
+sha2 = "0.10"
+hkdf = "0.12"
+# RNG, constant-time comparison, zeroization
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[features]
+# Compiles the in-binary fuzz harness (`--fuzz <target>`). Off by default: a node in the
+# field has no business carrying a mutation engine, however unreachable it is from the
+# network. `cargo run --features fuzz --release -- --fuzz all`
+fuzz = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NOT panic="abort": aborting skips graceful shutdown and every Zeroize drop, so a panic
+# would leave key material in memory and in-flight work abandoned.
