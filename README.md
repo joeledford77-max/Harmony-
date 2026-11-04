@@ -12,7 +12,9 @@
 ![Attack suite](https://img.shields.io/badge/attack_suite-0_fail-2ea44f)
 ![Patent pending](https://img.shields.io/badge/patent-pending-555)
 
-![Harmony's live dashboard on the phone: the thermal rules pick the cool phone, Llama picks the laptop](docs/hero.jpg)
+[![Harmony's live dashboard on the phone: the thermal rules pick the cool phone, Llama picks the laptop. Click to watch the demo.](docs/hero.jpg)](https://youtu.be/hsN0GdCThqI)
+
+▶ **[Watch the 2:45 demo](https://youtu.be/hsN0GdCThqI)** · [the note](https://youtu.be/hsN0GdCThqI?t=29) · [Llama reads it](https://youtu.be/hsN0GdCThqI?t=42) · [jobs follow it](https://youtu.be/hsN0GdCThqI?t=67) · [the rules veto](https://youtu.be/hsN0GdCThqI?t=74) · [dashboard](https://youtu.be/hsN0GdCThqI?t=97) · [security](https://youtu.be/hsN0GdCThqI?t=134) · [results](https://youtu.be/hsN0GdCThqI?t=145)
 
 > [!NOTE]
 > **Patent pending:** U.S. Patent Application No. 64/159,607. Copyright © 2026 joeledford77-max. All rights
