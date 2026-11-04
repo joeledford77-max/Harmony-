@@ -4,8 +4,10 @@
 #   bash ~/node.sh start     start it; refuses if one is already running; waits until it says ready
 #   bash ~/node.sh stop      graceful: the node refuses new jobs, says goodbye to its peers (they
 #                            drop it at once), finishes in-flight work, exits. SIGKILL only if it
-#                            is still running after STOP_WAIT seconds (default 30).
+#                            is still running after STOP_WAIT seconds (default 45).
 #   bash ~/node.sh restart   stop + start (after a rebuild, or to clear a mock temperature)
+#   bash ~/node.sh check     the sync check every start ends with: one node here, node.env's
+#                            settings, and every device on the mesh's newest build
 #   bash ~/node.sh status    which build answers, its pid, state, temperature, peers, AI placement
 #   bash ~/node.sh log       follow the node's log
 #
@@ -20,7 +22,10 @@ GW=${GW_DIR:-$HOME/harmony_gateway}
 BIN=$GW/target/release/rust_p2p_node
 LOG=$HOME/p2p.log
 ENV_FILE=$HOME/.harmony/node.env
-STOP_WAIT=${STOP_WAIT:-30}
+# The node bounds its own shutdown at about 30 s (farewell 3 + requests 10 + background work 10 +
+# the model server 5): give it that and some, then force it.
+STOP_WAIT=${STOP_WAIT:-45}
+KILL_WAIT=${KILL_WAIT:-15}   # a killed process can take seconds to go on a hot, loaded machine
 START_WAIT=${START_WAIT:-45}
 CMD=${1:-status}
 [ $# -gt 0 ] && shift
@@ -128,7 +133,7 @@ status() {
   case $exe in *" (deleted)") warn "running an old binary (rebuilt since it started): bash ~/node.sh restart";; esac
   local hp; hp=$(jf pid <<<"$h")
   [ -n "$hp" ] && [ "$hp" != "$pid" ] && warn "the node answering on :$port is pid $hp, not $pid"
-  note "temperature $(jf thermal_c <<<"$h") °C / limit $(jf max_temp <<<"$h")${mock:+   (MOCK: HARMONY_MOCK_TEMP=$mock — restart without it to use the sensor)} · model $(jf tier <<<"$h") · $(jf peers <<<"$h") peer(s)"
+  note "temperature $(jf thermal_c <<<"$h" | awk '{ printf "%.1f", $1 }') °C / limit $(jf max_temp <<<"$h")${mock:+   (MOCK: HARMONY_MOCK_TEMP=$mock — restart without it to use the sensor)} · model $(jf tier <<<"$h") · $(jf peers <<<"$h") peer(s)"
   local pl; pl=$(jf placement <<<"$h")
   if [ -n "$pl" ]; then note "AI placement: jobs → $(jf target_name <<<"$pl") ($(jf reason <<<"$pl"))$( [ -n "$(jf veto_now <<<"$pl")" ] && echo " — vetoed: $(jf veto_now <<<"$pl")")"; fi
   [ -n "$build" ] && note "dashboard: http://127.0.0.1:$port/ui"
@@ -149,11 +154,24 @@ stop() {
   if [ -n "$(live_pids)" ]; then
     warn "still running after ${STOP_WAIT}s: forcing it (SIGKILL)"
     # shellcheck disable=SC2046
-    kill -KILL $(live_pids) 2>/dev/null; sleep 1
+    kill -KILL $(live_pids) 2>/dev/null
+    local k=0
+    while [ $k -lt "$KILL_WAIT" ] && [ -n "$(live_pids)" ]; do sleep 1; k=$((k + 1)); done
   fi
-  strip < "$LOG" 2>/dev/null | grep -E 'told [0-9]+/[0-9]+ peer|still in flight|did not finish|shutdown complete' | tail -n 3 \
+  strip 2>/dev/null < "$LOG" | grep -E 'told [0-9]+/[0-9]+ peer|still in flight|did not finish|shutdown complete' | tail -n 3 \
     | sed 's/.*rust_p2p_node: /     /'
-  if [ -n "$(live_pids)" ]; then bad "could not stop pid $(live_pids | tr '\n' ' ')"; return 1; fi
+  if [ -n "$(live_pids)" ]; then
+    local p st who
+    for p in $(live_pids); do
+      st=$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null); who=$(stat -c %U "/proc/$p" 2>/dev/null)
+      case $st in
+        D) bad "could not stop pid $p: it is stuck in the kernel (state D) and ignores even SIGKILL; only a reboot frees it";;
+        *) if [ -n "$who" ] && [ "$who" != "$(id -un)" ]; then bad "could not stop pid $p: it belongs to $who (sudo kill $p)"
+           else bad "could not stop pid $p (state ${st:-gone?}): ps -o pid,stat,etime,args -p $p"; fi;;
+      esac
+    done
+    return 1
+  fi
   ok "stopped after ${t}s"
   is_phone && command -v termux-wake-unlock >/dev/null && termux-wake-unlock
   return 0
@@ -170,8 +188,11 @@ start() {
   is_phone && command -v termux-wake-lock >/dev/null && termux-wake-lock
   [ -s "$LOG" ] && mv -f "$LOG" "$LOG.1"
   cd "$GW" || return 1
-  if command -v setsid >/dev/null; then setsid nohup "$BIN" "$@" > "$LOG" 2>&1 < /dev/null &
-  else nohup "$BIN" "$@" > "$LOG" 2>&1 < /dev/null & fi
+  # Descriptors 3-9 closed: a node must not keep whatever its starter held open, such as the lock
+  # of `flock … node.sh restart` (it would hold that lock for its whole life, and the next
+  # restart through the same lock would wait for it and fail).
+  if command -v setsid >/dev/null; then setsid nohup "$BIN" "$@" > "$LOG" 2>&1 < /dev/null 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
+  else nohup "$BIN" "$@" > "$LOG" 2>&1 < /dev/null 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- & fi
   pid=$!
   cd - >/dev/null || true
   note "starting pid $pid ($(grep -oE '^[A-Z_]+=' "$ENV_FILE" | tr -d '=' | tr '\n' ' ')from $ENV_FILE)"
@@ -198,6 +219,7 @@ start() {
       if [ "$state" = ready ] || { [ -n "$h" ] && [ -z "$state" ]; }; then
         ok "ready after $((t / 2))s"
         status
+        sync_check
         return 0
       fi
     fi
@@ -206,11 +228,95 @@ start() {
   warn "not ready after ${START_WAIT}s (still bootstrapping?)"; status
 }
 
+# ---- sync check: after every start, and on its own with  bash ~/node.sh check
+# Is this device running one node, with the settings node.env asks for, on the mesh's newest build,
+# and are the other devices on it too? It only reads, and says what to run when something is off.
+# The laptop knows the build the phone last signed for the notebook (~/harmony_win_update/BUILD),
+# what the notebook installed (DEPLOYED) and when its watcher last reported; the phone asks the
+# laptop for those and its build in one ssh (HARMONY_SYNC_SSH in node.env, else joe@ the laptop in
+# HARMONY_PEERS). The notebook checks the laptop by itself every 15 s and installs a newer build.
+# SYNC_CHECK=0 skips it.
+tagnum() { local t=${1#harmony-v}; case $t in ''|*[!0-9]*) echo 0;; *) echo "$t";; esac; }
+node_list() {  # every rust_p2p_node on this device, any user: "pid user"
+  local p
+  { live_pids; is_phone || ps -e -o pid=,comm= 2>/dev/null | awk '$2 == "rust_p2p_node" { print $1 }'; } | sort -un |
+    while read -r p; do [ -d "/proc/$p" ] && echo "$p $(stat -c %U "/proc/$p" 2>/dev/null)"; done
+}
+sync_check() {
+  [ "${SYNC_CHECK:-1}" = 0 ] && return 0
+  local h port me n p u maxt tier mode want off="" view to seed newest=0 d b sum="" behind="" said age
+  printf '%s== sync check ==%s\n' "$C" "$N"
+  port=$(log_port); h=$(health "${port:-3005}")
+  me=$(jf build <<<"$h")
+  [ -n "$me" ] || { warn "the node does not answer yet: nothing to compare (later: bash ~/node.sh check)"; return 0; }
+  # 1. one node on this device, running what node.env asks for (a test can leave a temporary limit)
+  n=$(node_list | wc -l)
+  if [ "$n" -gt 1 ]; then
+    warn "$n nodes run on this device; one is expected:"
+    node_list | while read -r p u; do note "pid $p ($u): $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-90)"; done
+    note "stop them all, then start one: bash ~/node.sh stop; bash ~/node.sh start   (owned by root: sudo kill <pid>)"
+  fi
+  [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+  maxt=$(jf max_temp <<<"$h"); tier=$(jf tier <<<"$h"); mode=$(jf trust <<<"$h" | jf mode)
+  want=${HARMONY_MAX_TEMP_C:-65}
+  [ -n "$maxt" ] && awk -v a="$maxt" -v b="$want" 'BEGIN { exit !(a + 0 != b + 0) }' && off+=" limit $maxt °C (node.env: $want °C);"
+  [ -n "${HARMONY_TRUST_MODE:-}" ] && [ -n "$mode" ] && [ "$mode" != "$HARMONY_TRUST_MODE" ] && off+=" $mode trust (node.env: $HARMONY_TRUST_MODE);"
+  if [ -n "${HARMONY_MODEL_TIER:-}" ]; then case $tier in "$HARMONY_MODEL_TIER"*) ;; *) off+=" model $tier (node.env: $HARMONY_MODEL_TIER);";; esac; fi
+  if [ -n "$off" ]; then warn "it runs with settings node.env does not have:${off%;} (a test left them?): bash ~/node.sh restart"
+  elif [ "$n" -le 1 ]; then ok "one node here, with node.env's settings (limit $maxt °C, ${mode:-?} trust, $tier)"; fi
+  # 2. builds: the newest one anywhere is the mesh build; a device below it is behind
+  if [ -d "$HOME/harmony_win_update" ]; then
+    view="laptop $me
+staged $(cat "$HOME/harmony_win_update/BUILD" 2>/dev/null)
+notebook $(cat "$HOME/harmony_win_update/DEPLOYED" 2>/dev/null)
+$(f=$HOME/.harmony/notebook.status; [ -f "$f" ] && read -r t s < "$f" && echo "said $(( $(date +%s) - t )) $s")"
+  else
+    to=${HARMONY_SYNC_SSH:-}
+    if [ -z "$to" ]; then seed=${HARMONY_PEERS:-}; seed=${seed%%,*}; seed=${seed%:*}; [ -n "$seed" ] && to=joe@$seed; fi
+    [ -n "$to" ] || { note "no laptop known (HARMONY_PEERS): builds not compared"; return 0; }
+    view=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$to" 'p=$(sed "s/\x1b\[[0-9;]*m//g" ~/p2p.log 2>/dev/null | grep -aoE "mesh API on http://[^ ]+" | tail -n 1 | grep -oE "[0-9]+$")
+      echo "laptop $(curl -s --max-time 3 http://127.0.0.1:${p:-3005}/health | grep -o "\"build\":\"[^\"]*\"" | cut -d\" -f4)"
+      echo "staged $(cat ~/harmony_win_update/BUILD 2>/dev/null)"
+      echo "notebook $(cat ~/harmony_win_update/DEPLOYED 2>/dev/null)"
+      f=~/.harmony/notebook.status; [ -f "$f" ] && read -r t s < "$f" && echo "said $(( $(date +%s) - t )) $s"; true' 2>/dev/null)
+    [ -n "$view" ] || { warn "could not reach the laptop over ssh ($to): builds not compared"; return 0; }
+    view="phone $me
+$view"
+  fi
+  while read -r d b _; do
+    case $d in phone|laptop|staged|notebook) [ "$(tagnum "$b")" -gt "$newest" ] && newest=$(tagnum "$b");; esac
+  done <<<"$view"
+  while read -r d b _; do
+    case $d in
+      phone|laptop|notebook)
+        if [ -z "$b" ]; then sum+=" $d ?"
+        elif [ "$(tagnum "$b")" -lt "$newest" ]; then sum+=" $d $b (behind)"; behind+=" $d"
+        else sum+=" $d ✓"; fi;;
+      staged) [ -n "$b" ] && [ "$(tagnum "$b")" -lt "$newest" ] && { sum+=" (staged for the notebook: $b)"; behind+=" staged"; };;
+    esac
+  done <<<"$view"
+  if [ -z "$behind" ]; then ok "mesh build harmony-v$newest:$sum"
+  else
+    warn "mesh build harmony-v$newest:$sum"
+    case $behind in
+      *phone*|*laptop*|*staged*) note "bring them up: SKIP_TESTS=1 bash mesh_upgrade.sh (on the phone)";;
+      *) note "the notebook installs the staged build by itself within 15 s; if it does not, run the autosync line there (mesh_upgrade.sh prints it)";;
+    esac
+  fi
+  # 3. the notebook's watcher (node.ps1 v19.1+ reports every change, and every 5 minutes)
+  said=$(grep '^said ' <<<"$view"); age=$(awk '{ print $2 }' <<<"$said")
+  if [ -z "$said" ]; then note "notebook watcher: no report yet (node.ps1 older than v19.1, or autosync off)"
+  elif [ "${age:-0}" -gt 420 ]; then warn "notebook watcher: last report $((age / 60)) min ago (notebook asleep? else run the autosync line there): ${said#said * }"
+  else note "notebook watcher: reported $((age / 60)) min ago: ${said#said * }"; fi
+  return 0
+}
+
 case $CMD in
   start)   start "$@";;
   stop)    stop;;
   restart) stop && start "$@";;
   status)  status;;
+  check)   status && sync_check;;
   log|logs) tail -n 40 -f "$LOG";;
-  *) echo "usage: bash ~/node.sh start|stop|restart|status|log   (env: HARMONY_MOCK_TEMP, STOP_WAIT, START_WAIT)"; exit 2;;
+  *) echo "usage: bash ~/node.sh start|stop|restart|status|check|log   (env: HARMONY_MOCK_TEMP, STOP_WAIT, START_WAIT, SYNC_CHECK=0)"; exit 2;;
 esac

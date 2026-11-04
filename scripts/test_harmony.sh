@@ -35,7 +35,7 @@ CEW_HP=${CEW_URL#https://}
 P=$HOME/.harmony_test
 LOG=$HOME/harmony_test_$(date +%Y%m%d_%H%M%S).log
 MODE=${1:-all}
-HV=2026-11-02.v19.3
+HV=2026-11-03.v19.5
 PEER_DIRTY=0   # set while intent's veto step has the peer on a lowered limit
 # One exit path for every mode: stop throwaway nodes, put the peer back on its normal settings if
 # the veto step was interrupted, remove temp files.
@@ -770,10 +770,12 @@ wait_decision() {  # <directive id>
 relay_at_peer() {  # <directive id> <origin id> [intent: report the verdict without judging it]
   local id=$1 me=$2 judge=${3:-}
   hdr "at the peer ($PEER_SSH)"
-  local adv="" t2=$SECONDS item="" next=15
+  local adv="" t2=$SECONDS item="" next=15 out="" answered=0 pp
+  pp=$(peer_port | grep -E '^[0-9]+$'); pp=${pp:-3005}
   while [ $((SECONDS - t2)) -lt "${ADVISE_WAIT:-240}" ]; do
-    item=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER_SSH" 'curl -s --max-time 5 http://127.0.0.1:3005/relay' 2>/dev/null \
-           | jq -c --arg id "$id" '.[] | select(.id == $id)' 2>/dev/null)
+    out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER_SSH" "curl -s --max-time 5 http://127.0.0.1:$pp/relay" 2>/dev/null)
+    jq -e 'type == "array"' <<<"$out" >/dev/null 2>&1 && answered=1
+    item=$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$out" 2>/dev/null)
     if [ -z "$item" ]; then
       # In a mesh of three or more, another peer may have acknowledged first; this one gets it on
       # a later gossip round. Only after RELAY_WAIT is "not there" a refusal.
@@ -790,8 +792,10 @@ relay_at_peer() {  # <directive id> <origin id> [intent: report the verdict with
     esac
     sleep 10
   done
-  if [ -z "$item" ]; then
-    bad "the peer never took it in (not in its relay table after ${RELAY_WAIT:-120}s): start the peer with  --cmd-allow $me"; return 1; fi
+  if [ -z "$item" ] && [ "$answered" = 0 ]; then
+    bad "the node at $PEER_SSH did not answer on :$pp (down, or the laptop rebooted): bash mesh_upgrade.sh, or  ssh $PEER_SSH 'bash ~/node.sh start'"; return 1
+  elif [ -z "$item" ]; then
+    bad "the peer never took it in (not in its relay table after ${RELAY_WAIT:-120}s): is it on this node's gossip, and started with --cmd-allow ${me:0:12}…? (bash mesh_upgrade.sh sets both)"; return 1; fi
   ok "arrived: from ${me:0:12}, $(jq -r '.hops' <<<"$item") hop(s), signature verified at the peer"
   ADV_LAST=$adv
   case $adv in
@@ -855,9 +859,11 @@ test_placement() {  # <directive id>
 #   VETO=0        skip the veto step    VETO_MARGIN=  °C below the peer's temperature (5)
 # Restarts on the peer queue on a lock there, so a restart still running remotely when this
 # script is interrupted (the remote side does not die with ssh) finishes before the restore.
+# flock -o: the node a restart starts must not inherit the lock, or it holds it for its whole life
+# and the next restart (the restore) waits 120 s for it and fails.
 peer_node() {  # <node.sh args...> on $PEER_SSH; output in $T/peer
   ssh -o BatchMode=yes -o ConnectTimeout=8 "$PEER_SSH" "mkdir -p ~/.harmony; \
-    if command -v flock >/dev/null 2>&1; then env -u HARMONY_MOCK_TEMP flock -w 120 ~/.harmony/.node_sh.lock bash ~/node.sh $*; \
+    if command -v flock >/dev/null 2>&1; then env -u HARMONY_MOCK_TEMP flock -o -w 120 ~/.harmony/.node_sh.lock bash ~/node.sh $*; \
     else env -u HARMONY_MOCK_TEMP bash ~/node.sh $*; fi" > "$T/peer" 2>&1
 }
 peer_restore() {
@@ -947,7 +953,7 @@ test_intent() {
     fi
   fi
   if [ -n "${PEER_SSH:-}" ]; then
-    pb=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER_SSH" 'curl -s --max-time 5 http://127.0.0.1:3005/health' 2>/dev/null | jq -r '.build // empty' 2>/dev/null)
+    pb=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER_SSH" "curl -s --max-time 5 http://127.0.0.1:$(peer_port | grep -E '^[0-9]+$' || echo 3005)/health" 2>/dev/null | jq -r '.build // empty' 2>/dev/null)
     n=${pb#harmony-v}
     if [ -z "$pb" ]; then info "could not read $pname's build over ssh"
     elif [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 17 ]; then ok "$pname runs $pb: the node quotes what the note says about each device, its Llama judges each quote"
@@ -1186,6 +1192,8 @@ test_mesh() {
   local n; n=$(jq '[.[] | select(.thermal_c != null)] | length' "$T/body" 2>/dev/null || echo 0)
   if [ "${n:-0}" -ge 1 ]; then ok "$n peer(s) report their vitals on gossip"; else bad "no peer reports vitals: are the other nodes running?"; fi
   [ -n "${PEER_SSH:-}" ] || wrn "PEER_SSH is not set: the advisory and veto checks are skipped (PEER_SSH=joe@192.168.1.192)"
+  if [ -n "${PEER_SSH:-}" ] && ! peer_on_mesh; then
+    info "the rest of the run needs it on the mesh: fix that, then rerun"; return; fi
   test_harden
   test_lifecycle
   test_rotate
@@ -1203,6 +1211,25 @@ test_mesh() {
 # Throwaway node from ROT_BASE+80; your nodes are only dialled, never changed. PEER_SSH = the laptop.
 peer_sh() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$PEER_SSH" "$@" 2>&1; }
 peer_port() { peer_sh 'sed "s/\x1b\[[0-9;]*m//g" ~/p2p.log 2>/dev/null | grep -oE "mesh API on http://[^ ]+" | tail -n 1 | grep -oE "[0-9]+$"' | tail -n 1; }
+# The node PEER_SSH reaches (the laptop) answers and is on this node's gossip (waits up to 30 s).
+peer_on_mesh() {
+  local pp ph pid i
+  pp=$(peer_port | grep -E '^[0-9]+$'); pp=${pp:-3005}
+  ph=$(peer_sh "curl -s --max-time 5 http://127.0.0.1:$pp/health")
+  pid=$(jq -r '.node // empty' <<<"$ph" 2>/dev/null)
+  if [ ${#pid} -ne 64 ]; then
+    bad "the node at $PEER_SSH does not answer on :$pp (down, or the laptop rebooted or is asleep): bash mesh_upgrade.sh, or  ssh $PEER_SSH 'bash ~/node.sh start'"
+    return 1
+  fi
+  for i in $(seq 10); do
+    req "$GW_URL/peers"
+    if jq -e --arg id "$pid" 'any(.[]; .id == $id and .thermal_c != null)' "$T/body" >/dev/null 2>&1; then
+      ok "$PEER_SSH runs ${pid:0:12} on :$pp, and it is on this node's gossip"; return 0; fi
+    sleep 3
+  done
+  bad "$PEER_SSH runs ${pid:0:12} on :$pp, but it is not on this node's gossip: bash mesh_upgrade.sh (it re-seeds both nodes with their current addresses)"
+  return 1
+}
 # a request through the gate exactly as the notebook's locked key makes it -> its output (stdout+stderr)
 gate_as_notebook() { peer_sh "SSH_ORIGINAL_COMMAND='$1' ~/.harmony/sync_gate.sh --forced"; }
 test_harden() {
