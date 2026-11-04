@@ -39,11 +39,12 @@ CEW_HP=${CEW_URL#https://}
 P=$HOME/.harmony_test
 LOG=$HOME/harmony_test_$(date +%Y%m%d_%H%M%S).log
 MODE=${1:-all}
-HV=2026-11-04.v19.6
+HV=2026-11-04.v19.7
 PEER_DIRTY=0   # set while intent's veto step has the peer on a lowered limit
 # One exit path for every mode: stop throwaway nodes, put the peer back on its normal settings if
 # the veto step was interrupted, remove temp files.
 on_exit() {
+  [ -n "${TICK:-}" ] && kill "$TICK" 2>/dev/null
   declare -F rot_stop >/dev/null && rot_stop
   declare -F burn_stop >/dev/null && burn_stop
   [ "$PEER_DIRTY" = 1 ] && peer_restore
@@ -493,10 +494,12 @@ ipost_tick() {  # <label> <url> <json> <max-time>
   # The request runs in the foreground, so a caller's timing ends the moment it returns; only
   # the progress ticker runs in the background (it used to be the other way round, which rounded
   # every timing up to the next whole second).
-  ( s=0; while sleep 15; do s=$((s + 15)); say "  … $label (${s}s)"; done ) &
-  tick=$!
+  # It also checks every round that this run is still alive ($$ is the main shell's pid even in a
+  # subshell): a run killed mid-call, or whose session closed, used to leave it ticking forever.
+  ( s=0; while sleep 15; do kill -0 $$ 2>/dev/null || exit 0; s=$((s + 15)); say "  … $label (${s}s)"; done ) &
+  tick=$!; TICK=$tick
   ipost "$@"
-  kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null
+  kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null; TICK=""
 }
 
 test_infer() {
@@ -1389,18 +1392,23 @@ fence_judge() {  # <who> <what was tried> <fence_probe output>
     esac
   done <<<"$left"
 }
-# running programs that carry the token -> "<pid>|exe|<program>|<command>" when it is built into the
-# binary, "<pid>|env:<VARS>|<program>|<command>" when it is only in the environment it inherited
+# running programs that carry the token -> "<pid>|exe|<program>|<mine>|<command>" when it is built into
+# the binary, "<pid>|env:<VARS>|<program>|<mine>|<command>" when it only inherited it. <mine> is "self"
+# for this run and the shell it was started from (they share its environment), else "other".
 token_procs() {
-  local d exe vars prog pat; declare -A hit=()
+  local d exe vars prog pat q mine anc=" "; declare -A hit=()
   pat=$(printf '%s_%s' HARMONY_ENTERPRISE SECRET)
+  q=$BASHPID
+  while [ -n "$q" ] && [ "$q" != 0 ]; do anc+="$q "; q=$(sed 's/.*) //' "/proc/$q/stat" 2>/dev/null | cut -d' ' -f2); done
   for d in /proc/[0-9]*; do
     exe=$(readlink "$d/exe" 2>/dev/null) || continue
     [ -n "${hit[$exe]+x}" ] || { if command grep -aqF "$pat" "$exe" 2>/dev/null; then hit[$exe]=1; else hit[$exe]=0; fi; }
     vars=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | command grep -F "$pat" | cut -d= -f1 | paste -sd, -)
     [ "${hit[$exe]}" = 1 ] || [ -n "$vars" ] || continue
     prog=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1); prog=${prog##*/}
-    echo "${d#/proc/}|$([ "${hit[$exe]}" = 1 ] && echo exe || echo "env:$vars")|$prog|$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-90)"
+    q=$(sed 's/.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f2)
+    if [[ $anc == *" ${d#/proc/} "* || $anc == *" $q "* ]]; then mine=self; else mine=other; fi
+    echo "${d#/proc/}|$([ "${hit[$exe]}" = 1 ] && echo exe || echo "env:$vars")|$prog|$mine|$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-90)"
   done
 }
 # where a shell would pick the token up at login (file:line)
@@ -1412,23 +1420,29 @@ token_source() {
 # Built in: that program accepts it. In the environment: only a program that reads that variable
 # would; shells, the test itself and v19's node (it reads HARMONY_ADMIN_TOKEN only) do not.
 judge_token_procs() {
-  local where=$1 lines=$2 src=$3 built admin envs live vars
+  local where=$1 lines=$2 src=$3 built admin envs live vars self others
   if [ -z "$lines" ]; then ok "no program running $where carries the leaked test token"; return; fi
   built=$(command grep '|exe|' <<<"$lines" || true)
-  admin=$(command grep -E '^[0-9]+\|env:([^|]*,)?HARMONY_ADMIN_TOKEN(,[^|]*)?\|rust_p2p_node' <<<"$lines" || true)
+  admin=$(command grep -E '^[0-9]+\|env:([^|]*,)?HARMONY_ADMIN_TOKEN(,[^|]*)?\|rust_p2p_node\|' <<<"$lines" || true)
   envs=$(command grep '|env:' <<<"$lines" || true)
-  live=$(command grep -vE '^[0-9]+\|env:[^|]*\|(bash|sh|dash|zsh|login|sleep|rust_p2p_node|llama-server|llama-completion|llama-cli|curl|ssh|timeout|jq|grep|tr|cut|head|tail|sed|awk|cat|env)\|' <<<"$envs" \
+  live=$(command grep -vE '^[0-9]+\|env:[^|]*\|(bash|sh|dash|zsh|login|sleep|rust_p2p_node|llama-server|llama-completion|llama-cli|curl|ssh|timeout|jq|grep|tr|cut|head|tail|sed|awk|cat|env|sort|paste|readlink)\|' <<<"$envs" \
          | command grep -vFx -f <(printf '%s\n' "$admin") | command grep . || true)
-  [ -z "$built" ] || bad "programs $where have the leaked token built in, so they accept it: $(cut -d'|' -f1,4 <<<"$built" | tr '\n' ' ')"
+  self=$(command grep '|self|' <<<"$envs" || true)
+  others=$(command grep '|other|' <<<"$envs" || true)
+  [ -z "$built" ] || bad "programs $where have the leaked token built in, so they accept it: $(cut -d'|' -f1,5 <<<"$built" | tr '\n' ' ')"
   [ -z "$admin" ] || bad "a node $where runs with the leaked token as HARMONY_ADMIN_TOKEN: set a new one and restart it"
-  [ -z "$live" ] || bad "other programs $where have the token in their environment and may read it: $(cut -d'|' -f1-4 <<<"$live" | tr '\n' ' ')"
+  [ -z "$live" ] || bad "other programs $where have the token in their environment and may read it: $(cut -d'|' -f1-3,5 <<<"$live" | tr '\n' ' ')"
   if [ -n "$envs" ] && [ -z "$admin" ] && [ -z "$live" ]; then
     vars=$(command grep -o 'env:[^|]*' <<<"$envs" | cut -d: -f2 | tr ',' '\n' | sort -u | paste -sd, -)
-    wrn "the leaked token sits in the environment $where as $vars, inherited by $(command grep -c . <<<"$envs") process(es)$(command grep -q '|rust_p2p_node|' <<<"$envs" && echo ", the node and its llama-server too (neither reads $vars)"); nothing running reads it"
+    wrn "the leaked token sits in the environment $where as $vars; nothing running reads it$(command grep -q '|rust_p2p_node|' <<<"$envs" && echo " (the node and its llama-server do not)")"
+    [ -z "$self" ] || info "the shell you ran this from has it: unset $vars there, or run from a new session"
+    if [ -n "$others" ]; then
+      info "other processes with it: $(awk -F'|' '{ printf "%s%s %s", (NR > 1 ? ", " : ""), $1, $3 }' <<<"$others") — leftovers from old sessions: kill $(cut -d'|' -f1 <<<"$others" | tr '\n' ' ')"
+    fi
   fi
   if [ -n "$envs" ]; then
     if [ -n "$src" ]; then info "it is set in: $(tr '\n' ' ' <<<"$src")— delete that line, open a new session, then bash ~/node.sh restart"
-    else info "no startup file sets it: a session exported it by hand; close those sessions, then bash ~/node.sh restart"; fi
+    else info "no startup file sets it any more"; fi
   fi
 }
 # seeds_report -> "<file mode> <dir mode> <path>" for every identity seed under ~/.harmony
