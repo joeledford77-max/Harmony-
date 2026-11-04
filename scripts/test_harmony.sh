@@ -39,7 +39,7 @@ CEW_HP=${CEW_URL#https://}
 P=$HOME/.harmony_test
 LOG=$HOME/harmony_test_$(date +%Y%m%d_%H%M%S).log
 MODE=${1:-all}
-HV=2026-11-04.v19.7
+HV=2026-11-04.v19.6
 PEER_DIRTY=0   # set while intent's veto step has the peer on a lowered limit
 # One exit path for every mode: stop throwaway nodes, put the peer back on its normal settings if
 # the veto step was interrupted, remove temp files.
