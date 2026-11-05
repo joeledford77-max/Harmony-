@@ -265,8 +265,8 @@ newer, llama.cpp with `llama-server` and `llama-completion` on the PATH, and a L
 from Meta under the Llama 3.2 Community License. On each device:
 
 ```bash
-git clone https://github.com/joeledford77-max/harmony-thermal-offload.git
-cd harmony-thermal-offload/harmony_gateway
+git clone https://github.com/joeledford77-max/Harmony-.git
+cd Harmony-/harmony_gateway
 cargo build --release
 # the model under the name its tier expects (1B: llama-3.2-1b-instruct.gguf), or use --model-path
 cp /path/to/Llama-3.2-3B-Instruct.gguf llama-3.2-3b-instruct.gguf
