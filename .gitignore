@@ -1,0 +1,15 @@
+# never publish: keys, certificates, revocation lists, tokens, models, builds
+target/
+*.key
+*.pem
+*.crt
+*.csr
+*.srl
+*.crl*
+.enroll_token
+*.gguf
+*.bak
+llama-cli
+llama-completion
+*.log
+.harmony*/
